@@ -153,6 +153,9 @@ class SX126xInterface(Interface):
         self.r_stat_snr  = None
 
         self.packet_queue    = []
+        # single lock guarding the radio: held across the whole TX sequence
+        # and across every RX status/drain operation, so the chip is never
+        # RX-continuous while a TX frame is being written to its FIFO
         self.tx_lock         = threading.Lock()
         self.interface_ready = True
         self.announce_rate_target = None
@@ -165,9 +168,12 @@ class SX126xInterface(Interface):
         self._airtime_short_start  = time.time()
         self._airtime_long_start   = time.time()
 
-        # Split-packet reassembly state
+        # Split-packet reassembly state. A legitimate split pair arrives
+        # back-to-back (worst case ~100 ms at SF12), so the pending window
+        # only needs to cover receive-side processing delays; keeping it
+        # short also keeps the random 4-bit seq collision window small.
         self._rx_fragments = {}   # seq_id -> (timestamp, data)
-        self._frag_timeout = 10.0 # seconds to wait for second fragment
+        self._frag_timeout = 1.0  # seconds a pending fragment may wait
 
         # Validate configuration
         validcfg = True
@@ -344,7 +350,9 @@ class SX126xInterface(Interface):
     def _channel_is_clear(self):
         """Check if the channel appears clear using RSSI-based carrier sense."""
         try:
-            rssi = self.radio.packetRssi()
+            # packetRssi() is the RSSI of the *last received* packet (stale);
+            # rssiInst() samples the channel right now (works during RX mode)
+            rssi = self.radio.rssiInst()
             return rssi < -90.0
         except Exception:
             return True
@@ -422,6 +430,10 @@ class SX126xInterface(Interface):
         payload = frame_data[1:]
 
         if not is_split:
+            # a whole frame with this sequence means any pending first
+            # fragment for the same seq can never be completed; drop it so
+            # a later unrelated split frame-2 cannot finish it into garbage
+            self._rx_fragments.pop(seq_id, None)
             return payload
 
         now = time.time()
@@ -432,11 +444,29 @@ class SX126xInterface(Interface):
         for k in stale:
             del self._rx_fragments[k]
 
-        if seq_id in self._rx_fragments:
-            _, first_payload = self._rx_fragments.pop(seq_id)
-            return first_payload + payload
-        else:
+        if len(payload) == SX126xInterface.FRAME_PAYLOAD_MAX:
+            # frame1: a split's first frame always carries exactly
+            # FRAME_PAYLOAD_MAX payload bytes. A pending entry with the same
+            # seq is a frame2 that arrived first, so concatenate in order.
+            if seq_id in self._rx_fragments:
+                ts, second_payload = self._rx_fragments.pop(seq_id)
+                if now - ts <= self._frag_timeout:
+                    return payload + second_payload
+                # pending fragment is stale (from another, unrelated split
+                # that happened to reuse the 4-bit seq): start fresh
             self._rx_fragments[seq_id] = (now, payload)
+            return None
+        else:
+            # frame2: only ever completes a pending frame1 with the same seq
+            if seq_id in self._rx_fragments:
+                ts, first_payload = self._rx_fragments.pop(seq_id)
+                if now - ts <= self._frag_timeout:
+                    return first_payload + payload
+                # stale fragment: the two halves belong to different
+                # packets, dropping both is the only safe outcome
+            # orphan frame2 (frame1 lost on air): nothing to reassemble,
+            # and storing it would only let an unrelated frame1 with the
+            # same random seq complete into a garbage packet
             return None
 
     #############################
@@ -450,6 +480,12 @@ class SX126xInterface(Interface):
         self.radio.beginPacket()
         self.radio.put(frame)
         self.radio.endPacket()
+        # Wait for the TX-done GPIO interrupt. The chip's airtime is short
+        # (~35 ms worst case at SF12/125 kHz), but on a loaded Pi Zero 2 W
+        # the RPi.GPIO callback thread can be CPU-starved for seconds, so a
+        # short timeout "misses" the TX-done edge and status() reports the
+        # stale STATUS_TX_WAIT (1) even though the frame went out. 10 s
+        # matches the original working value and survives the starvation.
         self.radio.wait(timeout=10)
 
         status = self.radio.status()
@@ -458,6 +494,23 @@ class SX126xInterface(Interface):
         else:
             RNS.log(str(self)+" TX failed with status "+str(status), RNS.LOG_WARNING)
             return False
+
+    def _drain_pending_rx(self):
+        """
+        Read a pending received frame out of the chip FIFO before we go
+        deaf for TX. Must be called with self.tx_lock held (so the RX loop
+        cannot drain concurrently). Returns frame bytes, or None.
+        """
+        from LoRaRF import SX126x
+        try:
+            if self.radio.status() == SX126x.STATUS_RX_DONE:
+                # drain() reads the full payload atomically in the driver
+                frame_data = self.radio.drain()
+                if frame_data:
+                    return frame_data
+        except Exception as e:
+            RNS.log(str(self)+" Error draining pending RX frame: "+str(e), RNS.LOG_ERROR)
+        return None
 
     def process_incoming(self, data):
         """Called when a complete packet has been received and reassembled."""
@@ -476,8 +529,14 @@ class SX126xInterface(Interface):
             RNS.log(str(self)+" Dropping oversized packet ("+str(datalen)+" > "+str(self.HW_MTU)+")", RNS.LOG_ERROR)
             return
 
+        pending_frame = None
         with self.tx_lock:
             try:
+                # A frame may have been received (IRQ raised) while we were
+                # waiting for the lock. We are about to make the chip deaf
+                # for TX, so pull it out of the FIFO before we start.
+                pending_frame = self._drain_pending_rx()
+
                 frames = self._make_frames(data)
 
                 for i, frame in enumerate(frames):
@@ -500,9 +559,11 @@ class SX126xInterface(Interface):
                         self._start_rx()
                         return
 
-                    # Small inter-frame gap for split packets
+                    # Short inter-frame gap for split packets. The chip is
+                    # deaf while we hold the radio lock, so keep the gap
+                    # minimal to match the firmware's back-to-back behaviour
                     if len(frames) > 1 and i < len(frames) - 1:
-                        time.sleep(0.005)
+                        time.sleep(0.001)
 
                 self.txb += datalen
 
@@ -515,6 +576,13 @@ class SX126xInterface(Interface):
                     self._start_rx()
                 except Exception:
                     pass
+
+        # Deliver the drained frame outside the lock: reassembly and
+        # owner.inbound() can take milliseconds and must not block TX
+        if pending_frame is not None:
+            packet = self._reassemble(pending_frame)
+            if packet is not None:
+                self.process_incoming(packet)
 
     def _start_rx(self):
         """Put the radio into continuous receive mode."""
@@ -530,25 +598,32 @@ class SX126xInterface(Interface):
 
         while self.online and not self.detached:
             try:
+                # wait() outside the radio lock: it blocks for up to 1 s and
+                # must not hold the lock that TX needs. It only returns True
+                # once the IRQ callback has raised an event (or timeout).
                 if self.radio.wait(timeout=1):
-                    status = self.radio.status()
-
-                    if status == SX126x.STATUS_RX_DONE:
-                        payload_len = self.radio.available()
-                        if payload_len > 0:
-                            frame_data = self.radio.get(payload_len)
-
+                    frame_data = None
+                    status = None
+                    # status()/drain() under the lock: they consume the IRQ
+                    # event flag and move the driver's buffer pointer, so
+                    # they must be atomic w.r.t. TX and _drain_pending_rx()
+                    with self.tx_lock:
+                        status = self.radio.status()
+                        if status == SX126x.STATUS_RX_DONE:
+                            frame_data = self.radio.drain()
                             try:
                                 self.r_stat_rssi = self.radio.packetRssi()
                                 self.r_stat_snr  = self.radio.snr()
                             except Exception:
                                 pass
 
-                            RNS.log(str(self)+" Received frame ("+str(len(frame_data))+" bytes, RSSI: "+str(self.r_stat_rssi)+", SNR: "+str(self.r_stat_snr)+")", RNS.LOG_DEBUG)
-
-                            packet = self._reassemble(frame_data)
-                            if packet is not None:
-                                self.process_incoming(packet)
+                    # reassembly + owner.inbound() outside the lock: they
+                    # can take milliseconds and must not block TX
+                    if frame_data:
+                        RNS.log(str(self)+" Received frame ("+str(len(frame_data))+" bytes, RSSI: "+str(self.r_stat_rssi)+", SNR: "+str(self.r_stat_snr)+")", RNS.LOG_DEBUG)
+                        packet = self._reassemble(frame_data)
+                        if packet is not None:
+                            self.process_incoming(packet)
 
                     elif status == SX126x.STATUS_CRC_ERR:
                         RNS.log(str(self)+" CRC error on received frame", RNS.LOG_DEBUG)
