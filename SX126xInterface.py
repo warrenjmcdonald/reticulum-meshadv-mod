@@ -27,7 +27,7 @@
 #     bandwidth = 125000                                 #
 #     spreadingfactor = 8                                #
 #     codingrate = 5                                     #
-#     txpower = 22                                       #
+#     txpower = 22                                       #  dBm, -9 .. +22 (alias: tx_power)
 #     spi_bus = 0                                        #
 #     spi_cs = 0                                         #
 #     pin_cs = 21                                        #
@@ -37,6 +37,16 @@
 #     pin_txen = 13                                      #
 #     pin_rxen = 12                                      #
 #     dio3_tcxo_voltage = 1.8                            #
+#                                                        #
+#   # Optional: participate in RNS Discovery            #
+#     discoverable = True                                #
+#     discovery_name = MeshAdv Pi                        #
+#     latitude = 55.6761                                 #
+#     longitude = 12.5683                                #
+#     height = 30                                        #
+#     # discovery_frequency = 915000000  # announce override
+#     # discovery_bandwidth = 125000     # announce override
+#     # discovery_announce_as = RNodeInterface          #
 #                                                        #
 # License: MIT                                           #
 ##########################################################
@@ -50,24 +60,127 @@ import math
 import os
 import random
 
-# Make RNS Discovery Announcements recognise this interface type.
-# RNS.Discovery.InterfaceAnnouncer.get_interface_announce_data() refuses
-# to generate announce data for interface types not listed in
-# DISCOVERABLE_INTERFACE_TYPES (a closed list that does not include
-# custom interfaces), and the per-node opt-in ("discoverable = true" in
-# rnsd.conf) only takes effect if this list check also passes. Add our
-# type once, guarded so this stays inert if a future RNS reworks
-# discovery. Note: for the announce to actually carry the LoRa radio
-# parameters (frequency/bandwidth/SF/CR) like an RNode does, apply the
-# companion RNS-side patch (sx126x_discovery.patch); without it the
-# announcement still works and carries name/location/LXMF address, just
-# not the radio parameters.
+# -------------------------------------------------------
+# RNS interface discovery support (no RNS modifications).
+#
+# Stock RNS discovery (RNS/Discovery.py) is built around a closed list
+# of interface types, which is what makes a custom interface invisible:
+#
+#   * InterfaceAnnouncer.get_interface_announce_data() refuses to build
+#     announce data for types not in DISCOVERABLE_INTERFACE_TYPES, and
+#     emits LoRa radio parameters (frequency/bandwidth/SF/CR) only in
+#     its RNodeInterface branch, which reads interface.frequency,
+#     interface.bandwidth, interface.sf and interface.cr.
+#   * The receiver (received_announce) rejects announces whose type is
+#     not in DISCOVERABLE_INTERFACE_TYPES, so stock RNS nodes drop any
+#     "SX126xInterface" announce outright.
+#   * InterfaceDiscovery.interface_discovered() additionally drops
+#     announces whose type is not in a second list, DISCOVERABLE_TYPES.
+#
+# Instead of patching discovery.py, this module hooks into it at import
+# time:
+#
+#   1. "SX126xInterface" is added to both allow lists, so nodes running
+#      this interface store and list announces of this type.
+#   2. get_interface_announce_data() is wrapped: for an SX126xInterface
+#      the stock builder is handed a thin read-through view of the
+#      interface whose class name is the announced type (config key
+#      "discovery_announce_as", default "RNodeInterface"). The stock
+#      builder keys everything off type(interface).__name__, and the
+#      RNodeInterface branch reads exactly the attribute names this
+#      interface exposes, so unmodified RNS code emits the full
+#      announce - name, location, LXMF address, IFAC, frequency,
+#      bandwidth, SF, CR and the suggested config entry - and every
+#      stock RNS receiver decodes, stores and displays it like an
+#      ordinary RNode announce. This mirrors RNS's own practice of
+#      announcing KISS-framed TCPClientInterfaces as "KISSInterface".
+#      "discovery_frequency" / "discovery_bandwidth" in the interface
+#      section override the announced radio parameters without touching
+#      the live radio configuration.
+#
+# All hooks are guarded and idempotent: if a future RNS reworks
+# discovery the interface still loads, just without full discovery.
+# -------------------------------------------------------
 try:
-    _sx126x_discovery_allowlist = RNS.Discovery.InterfaceAnnouncer.DISCOVERABLE_INTERFACE_TYPES
-    if "SX126xInterface" not in _sx126x_discovery_allowlist:
-        _sx126x_discovery_allowlist.append("SX126xInterface")
-except Exception:
-    pass
+    _sx126x_discovery = RNS.Discovery
+
+    def _sx126x_discovery_register():
+        """Add SX126xInterface to RNS's discovery allow lists (once)."""
+        for allowlist in (_sx126x_discovery.InterfaceAnnouncer.DISCOVERABLE_INTERFACE_TYPES,
+                          _sx126x_discovery.InterfaceDiscovery.DISCOVERABLE_TYPES):
+            if "SX126xInterface" not in allowlist:
+                allowlist.append("SX126xInterface")
+
+    class _SX126xAnnounceView:
+        """
+        Read-through view of an SX126xInterface for the stock discovery
+        builder. Attribute reads are delegated to the real interface
+        (except for a small set of per-announce overrides), attribute
+        writes are forwarded to it (the stock builder writes back
+        location values), so the live interface is used exactly as the
+        stock code would use any interface and never mutated in place.
+        """
+        def __init__(self, inner, overrides):
+            object.__setattr__(self, "_sx126x_inner", inner)
+            object.__setattr__(self, "_sx126x_overrides", overrides)
+
+        def __getattr__(self, name):
+            overrides = self.__dict__.get("_sx126x_overrides") or {}
+            if name in overrides:
+                return overrides[name]
+            return getattr(self.__dict__["_sx126x_inner"], name)
+
+        def __setattr__(self, name, value):
+            if name in ("_sx126x_inner", "_sx126x_overrides"):
+                object.__setattr__(self, name, value)
+            else:
+                setattr(self.__dict__["_sx126x_inner"], name, value)
+
+    def _sx126x_make_announce_view(interface, announced_type):
+        """Build the view of interface that the stock builder sees as <announced_type>."""
+        overrides = {}
+        # discovery_frequency / discovery_bandwidth (valid interface
+        # config keys, normally consumed only by the Weave/KISS builder
+        # branches) override the announced radio parameters.
+        if getattr(interface, "discovery_frequency", None) is not None:
+            overrides["frequency"] = interface.discovery_frequency
+        if getattr(interface, "discovery_bandwidth", None) is not None:
+            overrides["bandwidth"] = interface.discovery_bandwidth
+        # The stock builder puts discovery_name (not the interface name)
+        # into the announce; fall back to the interface name so the
+        # announce is not anonymous when discovery_name is unset.
+        if not getattr(interface, "discovery_name", None):
+            overrides["discovery_name"] = interface.name
+        view_class = type(announced_type, (_SX126xAnnounceView,), {})
+        return view_class(interface, overrides)
+
+    def _sx126x_install_announce_hook():
+        """
+        Wrap InterfaceAnnouncer.get_interface_announce_data() so that
+        SX126xInterface announces carry the full LoRa radio parameters
+        (see module comment above). Idempotent.
+        """
+        announcer = _sx126x_discovery.InterfaceAnnouncer
+        builder = announcer.get_interface_announce_data
+        if getattr(builder, "_sx126x_hooked", False):
+            return
+
+        def get_interface_announce_data(self, interface):
+            if type(interface).__name__ == "SX126xInterface":
+                announced_type = getattr(interface, "discovery_announce_as", None) or "RNodeInterface"
+                return builder(self, _sx126x_make_announce_view(interface, announced_type))
+            return builder(self, interface)
+
+        get_interface_announce_data._sx126x_hooked = True
+        announcer.get_interface_announce_data = get_interface_announce_data
+
+    _sx126x_discovery_register()
+    _sx126x_install_announce_hook()
+except Exception as _sx126x_discovery_error:
+    try:
+        RNS.log(f"Could not hook RNS interface discovery for SX126xInterface: {_sx126x_discovery_error}", RNS.LOG_WARNING)
+    except Exception:
+        pass
 
 
 class SX126xInterface(Interface):
@@ -188,6 +301,26 @@ class SX126xInterface(Interface):
         # "discoverable = true" in its rnsd.conf interface section
         # (and requires the LXMF package to be installed).
         self.supports_discovery = True
+        # The interface type carried in the discovery announce (see the
+        # discovery hooks at the top of this module). The stock RNS
+        # builder only emits LoRa radio parameters in its
+        # RNodeInterface branch, and stock receivers only fully decode
+        # types they know, so the default announces this interface as
+        # "RNodeInterface" - functionally accurate (an RNS node over a
+        # LoRa radio) and the only choice every stock RNS node decodes,
+        # stores and displays. Any stock-discoverable type name is
+        # accepted; "SX126xInterface" is the honest label, but then the
+        # announce carries no radio parameters and is only recognisable
+        # by nodes that also run this interface module (or the
+        # companion sx126x_discovery.patch).
+        discovery_announce_as = c["discovery_announce_as"] if "discovery_announce_as" in c else "RNodeInterface"
+        try:
+            if discovery_announce_as not in RNS.Discovery.InterfaceAnnouncer.DISCOVERABLE_INTERFACE_TYPES:
+                RNS.log(f"Invalid discovery_announce_as \"{discovery_announce_as}\" for {name}: not a type RNS discovery can build. Using \"RNodeInterface\" instead.", RNS.LOG_ERROR)
+                discovery_announce_as = "RNodeInterface"
+        except Exception:
+            pass
+        self.discovery_announce_as = discovery_announce_as
 
         self.packet_queue    = []
         # single lock guarding the radio: held across the whole TX sequence
