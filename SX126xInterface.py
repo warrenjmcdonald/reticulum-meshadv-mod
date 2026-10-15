@@ -380,6 +380,7 @@ class SX126xInterface(Interface):
         """
         slot_time = self.csma_slot_ms / 1000.0
         attempt = 0
+        busy_attempts = 0
 
         while attempt < self.csma_max_backoff * 10:
             if self._channel_is_clear():
@@ -388,6 +389,7 @@ class SX126xInterface(Interface):
                 else:
                     time.sleep(slot_time)
             else:
+                busy_attempts += 1
                 backoff_exp = min(attempt // 2, self.csma_max_backoff)
                 max_slots = 2**backoff_exp
                 wait_slots = random.randint(0, max_slots)
@@ -395,7 +397,15 @@ class SX126xInterface(Interface):
 
             attempt += 1
 
-        RNS.log(str(self)+" CSMA gave up after "+str(attempt)+" attempts, transmitting", RNS.LOG_DEBUG)
+        # Note: reaching this point is NOT a carrier-sense failure — p-
+        # persistent CSMA simply did not roll a transmit within the
+        # attempt cap. Distinguish the two causes in the log: at
+        # csma_p=0.1 with a 10-attempt cap, ~35% of transmissions log
+        # this on a perfectly clear channel (0.9^10).
+        if busy_attempts:
+            RNS.log(str(self)+" CSMA channel busy in "+str(busy_attempts)+" of "+str(attempt)+" attempts, transmitting", RNS.LOG_DEBUG)
+        else:
+            RNS.log(str(self)+" CSMA p-persistent lottery exhausted after "+str(attempt)+" clear attempts, transmitting", RNS.LOG_DEBUG)
 
     #############################
     # Split-Packet Framing      #
