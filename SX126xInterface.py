@@ -117,6 +117,10 @@ class SX126xInterface(Interface):
         self.csma_p           = float(c["csma_p"])           if "csma_p" in c else 0.1
         self.csma_slot_ms     = float(c["csma_slot_ms"])     if "csma_slot_ms" in c else 50.0
         self.csma_max_backoff = int(c["csma_max_backoff"])    if "csma_max_backoff" in c else 5
+        # Channel is considered busy when instantaneous RSSI is above this
+        # level (dBm). Only meaningful while the chip is in RX mode; the
+        # transmit loop keeps it in RX between frames (see process_outgoing).
+        self.csma_rssi_threshold = float(c["csma_rssi_threshold"]) if "csma_rssi_threshold" in c else -90.0
 
         # Airtime limits (optional, percent 0-100)
         self.st_alock = float(c["airtime_limit_short"]) if "airtime_limit_short" in c else None
@@ -358,10 +362,14 @@ class SX126xInterface(Interface):
     def _channel_is_clear(self):
         """Check if the channel appears clear using RSSI-based carrier sense."""
         try:
-            # packetRssi() is the RSSI of the *last received* packet (stale);
-            # rssiInst() samples the channel right now (works during RX mode)
+            # rssiInst() samples the channel right now, but is only valid
+            # while the chip is actually in RX mode — in STANDBY the RSSI
+            # register reads 0 (i.e. 0 dBm, "busy" at any negative
+            # threshold). process_outgoing re-enters RX before every CSMA
+            # check so the reading is live. (packetRssi() would be the RSSI
+            # of the *last received* packet — stale — and is unsuitable.)
             rssi = self.radio.rssiInst()
-            return rssi < -90.0
+            return rssi < self.csma_rssi_threshold
         except Exception:
             return True
 
@@ -585,6 +593,16 @@ class SX126xInterface(Interface):
                 frames = self._make_frames(data)
 
                 for i, frame in enumerate(frames):
+                    # After each TX the chip falls back to STANDBY, where the
+                    # instantaneous RSSI register reads 0 — misread by
+                    # _channel_is_clear() as a 0 dBm (very strong) signal,
+                    # i.e. "busy" at any negative threshold, which produced
+                    # spurious "CSMA gave up" bursts between split frames.
+                    # Re-enter RX continuous before every carrier-sense check
+                    # (a no-op via the driver's guard when already in RX) and
+                    # let the RX chain settle so rssiInst() is live.
+                    self._start_rx()
+                    time.sleep(0.001)
                     self._csma_wait(len(frame))
 
                     toa = self._calculate_toa(len(frame))
@@ -603,12 +621,6 @@ class SX126xInterface(Interface):
                         RNS.log(str(self)+" Frame transmission failed", RNS.LOG_WARNING)
                         self._start_rx()
                         return
-
-                    # Short inter-frame gap for split packets. The chip is
-                    # deaf while we hold the radio lock, so keep the gap
-                    # minimal to match the firmware's back-to-back behaviour
-                    if len(frames) > 1 and i < len(frames) - 1:
-                        time.sleep(0.001)
 
                 self.txb += datalen
 
