@@ -50,6 +50,25 @@ import math
 import os
 import random
 
+# Make RNS Discovery Announcements recognise this interface type.
+# RNS.Discovery.InterfaceAnnouncer.get_interface_announce_data() refuses
+# to generate announce data for interface types not listed in
+# DISCOVERABLE_INTERFACE_TYPES (a closed list that does not include
+# custom interfaces), and the per-node opt-in ("discoverable = true" in
+# rnsd.conf) only takes effect if this list check also passes. Add our
+# type once, guarded so this stays inert if a future RNS reworks
+# discovery. Note: for the announce to actually carry the LoRa radio
+# parameters (frequency/bandwidth/SF/CR) like an RNode does, apply the
+# companion RNS-side patch (sx126x_discovery.patch); without it the
+# announcement still works and carries name/location/LXMF address, just
+# not the radio parameters.
+try:
+    _sx126x_discovery_allowlist = RNS.Discovery.InterfaceAnnouncer.DISCOVERABLE_INTERFACE_TYPES
+    if "SX126xInterface" not in _sx126x_discovery_allowlist:
+        _sx126x_discovery_allowlist.append("SX126xInterface")
+except Exception:
+    pass
+
 
 class SX126xInterface(Interface):
     MAX_CHUNK         = 32768
@@ -155,6 +174,20 @@ class SX126xInterface(Interface):
         self.bitrate     = 0
         self.r_stat_rssi = None
         self.r_stat_snr  = None
+        # RNS.Transport._inbound() only copies per-packet PHY stats from
+        # the interface onto the received packet (and into the local
+        # client caches that back rnprobe's RSSI/SNR display) when this
+        # flag is set; the base Interface class defaults it to False.
+        # The RX loop below captures r_stat_rssi / r_stat_snr for every
+        # frame before owner.inbound(), so enabling this is what makes
+        # rnprobe show RSSI and SNR. (r_stat_q is left unset: the SX126x
+        # has no hardware link-quality metric equivalent to RNode's Q.)
+        self.reports_phy_stats = True
+        # Participate in RNS Discovery Announcements. Whether a node
+        # actually announces is still opt-in per node via
+        # "discoverable = true" in its rnsd.conf interface section
+        # (and requires the LXMF package to be installed).
+        self.supports_discovery = True
 
         self.packet_queue    = []
         # single lock guarding the radio: held across the whole TX sequence
@@ -588,6 +621,11 @@ class SX126xInterface(Interface):
                 # drain() reads the full payload atomically in the driver
                 frame_data = self.radio.drain()
                 if frame_data:
+                    try:
+                        self.r_stat_rssi = self.radio.packetRssi()
+                        self.r_stat_snr  = self.radio.snr()
+                    except Exception:
+                        pass
                     return frame_data
         except Exception as e:
             RNS.log(str(self)+" Error draining pending RX frame: "+str(e), RNS.LOG_ERROR)
@@ -597,8 +635,16 @@ class SX126xInterface(Interface):
         """Called when a complete packet has been received and reassembled."""
         self.rxb += len(data)
         self.owner.inbound(data, self)
-        self.r_stat_rssi = None
-        self.r_stat_snr  = None
+        # Do NOT clear r_stat_rssi / r_stat_snr here: with
+        # Transport.USE_INBOUND_QUEUE (the default in RNS 1.5.x),
+        # owner.inbound() only ENQUEUES the packet and returns, and
+        # Transport._inbound() — the code that copies r_stat_* onto the
+        # packet (backing rnprobe's RSSI/SNR display) — runs later on the
+        # inbound drain thread. Clearing here would race ahead of it and
+        # every packet would arrive with None stats. RNodeInterface
+        # follows this same pattern: stats persist until the next frame's
+        # RX pass overwrites them, and each packet's stats are captured
+        # immediately before its frame is handed to owner.inbound().
 
     def process_outgoing(self, data):
         """Called by Reticulum to send a packet out this interface."""
