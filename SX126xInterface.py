@@ -168,6 +168,14 @@ class SX126xInterface(Interface):
         self._airtime_short_start  = time.time()
         self._airtime_long_start   = time.time()
 
+        # TX completion tracking. Every outcome is counted and logged so
+        # missed TxDone IRQ edges can be correlated with throughput drops
+        # during large transfers (see Prns issue #246 for the failure
+        # pattern this diagnoses: chip back in standby, TxDone IRQ lost).
+        self._tx_frames_ok         = 0  # completed via TxDone IRQ
+        self._tx_frames_missed_irq = 0  # healed: IRQ missed/late, frame presumed sent
+        self._tx_frames_failed     = 0  # could not be resolved as sent
+
         # Split-packet reassembly state. A legitimate split pair arrives
         # back-to-back (worst case ~100 ms at SF12), so the pending window
         # only needs to cover receive-side processing delays; keeping it
@@ -486,14 +494,51 @@ class SX126xInterface(Interface):
         # short timeout "misses" the TX-done edge and status() reports the
         # stale STATUS_TX_WAIT (1) even though the frame went out. 10 s
         # matches the original working value and survives the starvation.
-        self.radio.wait(timeout=10)
+        sent = self.radio.wait(timeout=10)
+
+        if sent and self.radio.status() == SX126x.STATUS_TX_DONE:
+            self._tx_frames_ok += 1
+            return True
 
         status = self.radio.status()
-        if status == SX126x.STATUS_TX_DONE:
-            return True
-        else:
-            RNS.log(str(self)+" TX failed with status "+str(status), RNS.LOG_WARNING)
+        if status == SX126x.STATUS_TX_TIMEOUT:
+            # a genuine chip-side TX timeout, not a missed edge
+            self._tx_frames_failed += 1
+            RNS.log(str(self)+" TX failed with status "+str(status)+" (TX failures: "+str(self._tx_frames_failed)+", missed IRQ: "+str(self._tx_frames_missed_irq)+")", RNS.LOG_WARNING)
             return False
+
+        # wait() timed out and the driver state is still TX_WAIT: the
+        # TxDone edge may have been missed or late while the chip already
+        # finished. Ask the driver to re-check the chip's IRQ register
+        # instead of paying a 10 s stall plus a retransmit for a frame
+        # that went out. If the frame was not actually sent, the RNS link
+        # layer retransmits it (packets are only acknowledged on
+        # reception), so a "presumed sent" verdict cannot lose data.
+        if self.radio.healTxDone():
+            self._tx_frames_missed_irq += 1
+            RNS.log(str(self)+" TxDone IRQ missed or late, frame presumed sent (missed IRQ: "+str(self._tx_frames_missed_irq)+", TX failures: "+str(self._tx_frames_failed)+")", RNS.LOG_WARNING)
+            return True
+
+        self._tx_frames_failed += 1
+        RNS.log(str(self)+" TX failed with status "+str(status)+" (TX failures: "+str(self._tx_frames_failed)+", missed IRQ: "+str(self._tx_frames_missed_irq)+")", RNS.LOG_WARNING)
+        return False
+
+    def tx_stats(self):
+        """
+        Return TX completion counters as a dict:
+          tx_ok         frames completed via the TxDone IRQ
+          tx_missed_irq frames healed after a missed/late TxDone IRQ edge
+          tx_failed     frames that could not be resolved as sent
+
+        If tx_missed_irq grows and the growth correlates with throughput
+        drops (e.g. NomadNet page fetches stalling), the radio's SPI
+        wiring or the Pi's GPIO callback thread is the culprit.
+        """
+        return {
+            "tx_ok": self._tx_frames_ok,
+            "tx_missed_irq": self._tx_frames_missed_irq,
+            "tx_failed": self._tx_frames_failed,
+        }
 
     def _drain_pending_rx(self):
         """
