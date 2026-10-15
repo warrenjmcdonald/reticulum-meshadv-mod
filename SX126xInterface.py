@@ -30,6 +30,7 @@
 #     txpower = 22                                       #  dBm, -9 .. +22 (alias: tx_power)
 #     spi_bus = 0                                        #
 #     spi_cs = 0                                         #
+#     gpio_chip = 0                                      #  /dev/gpiochipN number for the pins below (Raspberry Pi: 0)
 #     pin_cs = 21                                        #
 #     pin_irq = 16                                       #
 #     pin_busy = 20                                      #
@@ -234,6 +235,12 @@ class SX126xInterface(Interface):
         pin_txen  = int(c["pin_txen"])  if "pin_txen" in c else 13
         pin_rxen  = int(c["pin_rxen"])  if "pin_rxen" in c else 12
 
+        # GPIO chip (gpiochip) number for all the pins above: the driver
+        # opens /dev/gpiochip<gpio_chip>. On Raspberry Pi every BCM-numbered
+        # pin lives on gpiochip0; other boards may number their chips
+        # differently.
+        gpio_chip = int(c["gpio_chip"]) if "gpio_chip" in c else 0
+
         # DIO3 TCXO voltage (set to 0 or None to disable)
         dio3_tcxo = float(c["dio3_tcxo_voltage"]) if "dio3_tcxo_voltage" in c else 1.8
 
@@ -276,6 +283,7 @@ class SX126xInterface(Interface):
         self.sync_word   = sync_word
         self.spi_bus     = spi_bus
         self.spi_cs      = spi_cs
+        self.gpio_chip   = gpio_chip
         self.pin_cs      = pin_cs
         self.pin_irq     = pin_irq
         self.pin_busy    = pin_busy
@@ -407,21 +415,26 @@ class SX126xInterface(Interface):
 
     def _init_radio(self):
         """Initialise the SX1262/SX1268 radio chip over SPI."""
-        from LoRaRF import SX126x
+        from LoRaRF import SX126x, LoRaSpi, LoRaGpio
 
-        self.radio = SX126x()
+        RNS.log(str(self)+" Initialising SX126x on SPI bus "+str(self.spi_bus)+" CS "+str(self.spi_cs)+" (gpiochip"+str(self.gpio_chip)+")", RNS.LOG_VERBOSE)
 
-        RNS.log(str(self)+" Initialising SX126x on SPI bus "+str(self.spi_bus)+" CS "+str(self.spi_cs), RNS.LOG_VERBOSE)
+        # LoRaRF main-branch driver (gpiod 2.x based): the SPI device and
+        # each GPIO line are wrapped in LoRaSpi / LoRaGpio objects at
+        # construction time, and begin() then takes no arguments (it
+        # performs the reset and chip detection). The driver drives the CS
+        # GPIO pin around every SPI transaction itself.
+        self.radio = SX126x(
+            spi=LoRaSpi(self.spi_bus, self.spi_cs),
+            cs=LoRaGpio(self.gpio_chip, self.pin_cs),
+            reset=LoRaGpio(self.gpio_chip, self.pin_reset),
+            busy=LoRaGpio(self.gpio_chip, self.pin_busy),
+            irq=LoRaGpio(self.gpio_chip, self.pin_irq),
+            txen=LoRaGpio(self.gpio_chip, self.pin_txen),
+            rxen=LoRaGpio(self.gpio_chip, self.pin_rxen)
+        )
 
-        if not self.radio.begin(
-            bus=self.spi_bus,
-            cs=self.spi_cs,
-            reset=self.pin_reset,
-            busy=self.pin_busy,
-            irq=self.pin_irq,
-            txen=self.pin_txen,
-            rxen=self.pin_rxen
-        ):
+        if not self.radio.begin():
             raise IOError("SX126x radio not detected or failed to initialise")
 
         # Enable DIO3 as TCXO control if configured
@@ -692,7 +705,7 @@ class SX126xInterface(Interface):
         self.radio.endPacket()
         # Wait for the TX-done GPIO interrupt. The chip's airtime is short
         # (~35 ms worst case at SF12/125 kHz), but on a loaded Pi Zero 2 W
-        # the RPi.GPIO callback thread can be CPU-starved for seconds, so a
+        # the gpiod IRQ monitor thread can be CPU-starved for seconds, so a
         # short timeout "misses" the TX-done edge and status() reports the
         # stale STATUS_TX_WAIT (1) even though the frame went out. 10 s
         # matches the original working value and survives the starvation.
