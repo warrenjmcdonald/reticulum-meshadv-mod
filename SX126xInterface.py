@@ -180,12 +180,23 @@ class SX126xInterface(Interface):
         self._tx_frames_missed_irq = 0  # healed: IRQ missed/late, frame presumed sent
         self._tx_frames_failed     = 0  # could not be resolved as sent
 
-        # Split-packet reassembly state. A legitimate split pair arrives
-        # back-to-back (worst case ~100 ms at SF12), so the pending window
-        # only needs to cover receive-side processing delays; keeping it
-        # short also keeps the random 4-bit seq collision window small.
+        # Split-packet reassembly state.
+        #
+        # CRITICAL: _frag_timeout must be LONGER than the receiver-side
+        # arrival gap between frame1 and frame2. Frame2 is only reassembled
+        # when its reception COMPLETES, so the gap is
+        #     CSMA wait for frame2  +  frame2's own airtime
+        # At SF11/BW250/CR5 that is >= ~1.6 s (frame2 airtime alone is
+        # ~1.57 s); at SF12/BW125/CR5 it is >= ~6.3 s. The previous
+        # default of 1.0 s was shorter than frame2's airtime at any slow
+        # setting, so EVERY split packet was dropped as a "stale fragment"
+        # and retransmitted forever — the cause of stuck NomadNet page
+        # loads while short (single-frame) transfers kept working.
+        # 30 s covers all practical settings with wide margin; the only
+        # cost is a 254-byte buffer held a little longer (worst case 16
+        # seq slots x 254 B = 4 KB).
         self._rx_fragments = {}   # seq_id -> (timestamp, data)
-        self._frag_timeout = 1.0  # seconds a pending fragment may wait
+        self._frag_timeout = float(c["split_frag_timeout"]) if "split_frag_timeout" in c else 30.0
 
         # Validate configuration
         validcfg = True
@@ -477,6 +488,7 @@ class SX126xInterface(Interface):
             if seq_id in self._rx_fragments:
                 ts, second_payload = self._rx_fragments.pop(seq_id)
                 if now - ts <= self._frag_timeout:
+                    RNS.log(str(self)+" Reassembled split packet ("+str(len(payload + second_payload))+" bytes, frame2 arrived first)", RNS.LOG_DEBUG)
                     return payload + second_payload
                 # pending fragment is stale (from another, unrelated split
                 # that happened to reuse the 4-bit seq): start fresh
@@ -487,9 +499,15 @@ class SX126xInterface(Interface):
             if seq_id in self._rx_fragments:
                 ts, first_payload = self._rx_fragments.pop(seq_id)
                 if now - ts <= self._frag_timeout:
+                    RNS.log(str(self)+" Reassembled split packet ("+str(len(first_payload + payload))+" bytes)", RNS.LOG_DEBUG)
                     return first_payload + payload
                 # stale fragment: the two halves belong to different
-                # packets, dropping both is the only safe outcome
+                # packets, dropping both is the only safe outcome.
+                # If this line repeats for the same packet, _frag_timeout
+                # is too short for the current SF/BW: the receiver-side
+                # gap is CSMA wait + frame2's own airtime (>= ~1.6 s at
+                # SF11/BW250/CR5, >= ~6.3 s at SF12/BW125/CR5).
+                RNS.log(str(self)+" Split fragment expired after "+str(round(now - ts, 2))+" s (timeout "+str(self._frag_timeout)+" s), dropping both halves", RNS.LOG_DEBUG)
             # orphan frame2 (frame1 lost on air): nothing to reassemble,
             # and storing it would only let an unrelated frame1 with the
             # same random seq complete into a garbage packet
