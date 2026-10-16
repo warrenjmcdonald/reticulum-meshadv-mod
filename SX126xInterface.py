@@ -35,8 +35,8 @@
 #     pin_irq = 16                                       #
 #     pin_busy = 20                                      #
 #     pin_reset = 18                                     #
-#     pin_txen = 13                                      #
-#     pin_rxen = 12                                      #
+#     pin_txen = 13                                      #  -1 = not wired (e.g. DIO2-driven RF switch)
+#     pin_rxen = 12                                      #  -1 = not wired (e.g. DIO2-driven RF switch)
 #     dio3_tcxo_voltage = 1.8                            #
 #                                                        #
 #   # Optional: participate in RNS Discovery            #
@@ -424,14 +424,24 @@ class SX126xInterface(Interface):
         # construction time, and begin() then takes no arguments (it
         # performs the reset and chip detection). The driver drives the CS
         # GPIO pin around every SPI transaction itself.
+        # A TX/RX enable pin set to -1 means "not wired" (e.g. the RF
+        # switch is driven from DIO2 or does not need enabling): pass
+        # None so the driver skips driving that line. The same applies to
+        # the IRQ line: pin_irq < 0 means DIO1 is not wired to a GPIO,
+        # the driver then polls the chip's IRQ register in wait()
+        # instead of monitoring a line (RX still works, ~1 ms latency).
+        txen = LoRaGpio(self.gpio_chip, self.pin_txen) if self.pin_txen >= 0 else None
+        rxen = LoRaGpio(self.gpio_chip, self.pin_rxen) if self.pin_rxen >= 0 else None
+        irq  = LoRaGpio(self.gpio_chip, self.pin_irq)  if self.pin_irq  >= 0 else None
+
         self.radio = SX126x(
             spi=LoRaSpi(self.spi_bus, self.spi_cs),
             cs=LoRaGpio(self.gpio_chip, self.pin_cs),
             reset=LoRaGpio(self.gpio_chip, self.pin_reset),
             busy=LoRaGpio(self.gpio_chip, self.pin_busy),
-            irq=LoRaGpio(self.gpio_chip, self.pin_irq),
-            txen=LoRaGpio(self.gpio_chip, self.pin_txen),
-            rxen=LoRaGpio(self.gpio_chip, self.pin_rxen)
+            irq=irq,
+            txen=txen,
+            rxen=rxen
         )
 
         if not self.radio.begin():
