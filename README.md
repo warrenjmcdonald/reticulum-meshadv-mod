@@ -9,7 +9,7 @@ Designed for the **MeshAdv Pi HAT v1.1** but works with any SPI-connected SX126x
 Normally, Reticulum requires a separate RNode device (an ESP32 or nRF52 running RNode firmware) connected via USB serial. This interface eliminates that second device by talking directly to the SX1262 LoRa chip over the Pi's SPI bus.
 
 It implements:
-- **Direct SPI control** via the [LoRaRF-Python](https://github.com/chandrawi/LoRaRF-Python) library
+- **Direct SPI control** via the [LoRaRF-Python](https://github.com/warrenjmcdonald/LoRaRF-Python) library. Updated from the original to support improved IRQ monitoring and TX corruption protection. 
 - **CSMA/CA** collision avoidance (p-persistent, like RNode firmware)
 - **RNode-compatible split-packet framing** so the full 500-byte Reticulum MTU works over the 255-byte LoRa frame limit
 - **Airtime tracking and limiting**
@@ -36,14 +36,17 @@ Reboot if SPI wasn't already enabled.
 ### 2. Install dependencies
 
 ```bash
-pip install rns LoRaRF
+pip install rns
 ```
 
 Or if your OS restricts pip:
 
 ```bash
-pip install rns LoRaRF --break-system-packages
+pip install rns --break-system-packages
 ```
+
+Follow instructions at https://github.com/warrenjmcdonald/LoRaRF-Python for Git and Build Package to install the 1.5.0 LoRaRF-Python library. 
+
 
 ### 3. Install the interface module
 
@@ -104,6 +107,30 @@ Edit `~/.reticulum/config` and add an interface block. If the file doesn't exist
   pin_rxen = 12
   dio3_tcxo_voltage = 1.8
 ```
+
+#### Zindello Ind - Ultrapeater Zero HAT (E22P 915 MHz variant)
+
+```ini
+[[Ultrapeater Zero]]
+    type = SX126xInterface
+    enabled = yes
+    frequency = 925875000
+    bandwidth = 250000
+    spreadingfactor = 9
+    coding_rate = 5
+    txpower = 22
+    spi_bus = 0
+    spi_cs = 0
+    pin_cs = 24
+    pin_irq = 12
+    pin_busy = 5
+    pin_reset = 25
+    pin_txen = 27
+    pin_rxen = 16
+    dio3_tcxo_voltage = 1.8
+```
+
+
 
 #### With Transport enabled (router/repeater node)
 
@@ -176,6 +203,10 @@ The Waveshare HAT uses a UART-based E22 module, **not** direct SPI. It is **not 
 | `csma_max_backoff` | 5 | Max CSMA backoff exponent |
 | `airtime_limit_short` | (none) | Short-term airtime limit (%) |
 | `airtime_limit_long` | (none) | Long-term airtime limit (%) |
+| `csma_rssi_threshold`| -90 | Threshold for CSMA detection (dBm) |
+| `split_frag_timeout` | 30 | Timeout for payload reassembly (Sec) |
+
+Also now supports standard rnode Discoverable announce options with declared radio params 
 
 ## Interoperability with RNodes
 
@@ -290,17 +321,23 @@ The SX1262 can only transmit 255 bytes per LoRa frame, but Reticulum's MTU is 50
 
 This is wire-compatible with RNode firmware and the micropython-reticulum SX1262 interface.
 
+## Future enhancements
+
+- Addition Pin definitions for Chip EN and status LEDs
+- Config for DIO2 RFSwitch True/False 
+
 ## Contributing
 
 This is a community project filling a gap in the Reticulum ecosystem. If you test it on hardware, please report your results. PRs welcome for:
 - Additional board pin presets
 - Improved CSMA tuning
-- CAD (Channel Activity Detection) based carrier sense
+- CAD (Channel Activity Detection) based carrier sense 
 - Support for SX1276/SX1278 boards
 - Airtime accounting improvements
 
 ## Acknowledgements
 
+- [Andrew A G](https://github.com/Andrew-a-g) original project author
 - [Mark Qvist](https://github.com/markqvist) for Reticulum and the RNode platform
 - [Chris Myers](https://github.com/chrismyers2000) for the MeshAdv Pi HAT
 - [chandrawi](https://github.com/chandrawi/LoRaRF-Python) for the LoRaRF-Python library
