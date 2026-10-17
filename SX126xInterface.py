@@ -722,7 +722,9 @@ class SX126xInterface(Interface):
         sent = self.radio.wait(timeout=10)
 
         if sent and self.radio.status() == SX126x.STATUS_TX_DONE:
+            RNS.log(str(self)+" TX Success ", RNS.LOG_DEBUG)
             self._tx_frames_ok += 1
+
             return True
 
         status = self.radio.status()
